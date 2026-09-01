@@ -1,0 +1,237 @@
+name: Sync upstream stable
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Check every 6 hours
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPO: pingdotgg/t3code
+  STABLE_BRANCH: stable
+  PLUS_BRANCH: plus
+  BUMP_PREFIX: version-bump/
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "T3 Code Plus Bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Get latest upstream stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')
+
+          if [ -z "$TAG" ]; then
+            echo "Could not determine latest upstream release."
+            exit 1
+          fi
+
+          echo "Latest upstream release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream release
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
+          git fetch upstream --tags --force
+
+          TAG="${{ steps.release.outputs.tag }}"
+
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG does not exist after fetching upstream."
+            exit 1
+          fi
+
+      - name: Determine release commit
+        id: commit
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          RELEASE_SHA=$(git rev-list -n 1 "$TAG")
+
+          echo "Release: $TAG"
+          echo "Commit:  $RELEASE_SHA"
+
+          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check current stable
+        id: stable
+        run: |
+          CURRENT_STABLE=$(git ls-remote origin "refs/heads/${STABLE_BRANCH}" | cut -f1)
+          RELEASE_SHA="${{ steps.commit.outputs.sha }}"
+
+          echo "Current stable: ${CURRENT_STABLE:-<missing>}"
+          echo "Latest release: $RELEASE_SHA"
+
+          if [ "$CURRENT_STABLE" = "$RELEASE_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update stable branch
+        if: steps.stable.outputs.changed == 'true'
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+
+          echo "Moving ${STABLE_BRANCH} to $TAG"
+
+          git push origin \
+            "$TAG:refs/heads/${STABLE_BRANCH}" \
+            --force
+
+      - name: Create version bump branch
+        id: bump
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          RELEASE_SHA="${{ steps.commit.outputs.sha }}"
+          BUMP_BRANCH="${BUMP_PREFIX}${TAG}"
+
+          echo "Creating/updating $BUMP_BRANCH at $RELEASE_SHA"
+
+          git push origin \
+            "$RELEASE_SHA:refs/heads/$BUMP_BRANCH" \
+            --force
+
+          echo "branch=$BUMP_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Close stale version bump PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CURRENT_BRANCH="${{ steps.bump.outputs.branch }}"
+
+          gh pr list \
+            --state open \
+            --base "$PLUS_BRANCH" \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("'"$BUMP_PREFIX"'")) | "\(.number) \(.headRefName)"' \
+          | while read -r PR_NUMBER HEAD_BRANCH; do
+
+              if [ "$HEAD_BRANCH" != "$CURRENT_BRANCH" ]; then
+                echo "Closing stale PR #$PR_NUMBER ($HEAD_BRANCH)"
+
+                gh pr comment "$PR_NUMBER" \
+                  --body "Closing automatically because a newer upstream stable release is available."
+
+                gh pr close "$PR_NUMBER" \
+                  --delete-branch
+              fi
+
+            done
+
+      - name: Find or create version bump PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          BUMP_BRANCH="${{ steps.bump.outputs.branch }}"
+
+          PR_NUMBER=$(gh pr list \
+            --state open \
+            --base "$PLUS_BRANCH" \
+            --head "$BUMP_BRANCH" \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "Creating version bump PR for $TAG"
+
+            PR_URL=$(gh pr create \
+              --base "$PLUS_BRANCH" \
+              --head "$BUMP_BRANCH" \
+              --title "chore: update upstream to $TAG" \
+              --body "## Upstream version update
+
+          Updates **T3 Code Plus** to upstream stable release **$TAG**.
+
+          - Upstream: \`$UPSTREAM_REPO\`
+          - Stable tag: \`$TAG\`
+          - Stable branch: \`$STABLE_BRANCH\`
+          - Target branch: \`$PLUS_BRANCH\`
+
+          This PR was created automatically.
+
+          If it merges cleanly, the workflow will merge it automatically.
+          If there is a conflict or another merge failure, this PR will remain open for manual resolution.")
+
+            PR_NUMBER=$(gh pr view "$PR_URL" --json number --jq '.number')
+          else
+            echo "PR #$PR_NUMBER already exists."
+          fi
+
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Check PR mergeability
+        id: mergeability
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+
+          # GitHub may briefly report UNKNOWN while calculating mergeability.
+          # Retry a few times before deciding.
+          for i in {1..10}; do
+            MERGEABLE=$(gh pr view "$PR_NUMBER" \
+              --json mergeable \
+              --jq '.mergeable')
+
+            echo "Mergeability: $MERGEABLE"
+
+            if [ "$MERGEABLE" != "UNKNOWN" ]; then
+              break
+            fi
+
+            sleep 3
+          done
+
+          echo "mergeable=$MERGEABLE" >> "$GITHUB_OUTPUT"
+
+      - name: Merge clean version bump
+        if: steps.mergeability.outputs.mergeable == 'MERGEABLE'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+
+          echo "PR #$PR_NUMBER is mergeable. Attempting automatic merge."
+
+          if gh pr merge "$PR_NUMBER" \
+            --merge \
+            --delete-branch; then
+
+            echo "Version bump merged successfully."
+          else
+            echo "Automatic merge failed."
+            echo "Leaving PR #$PR_NUMBER open for manual intervention."
+
+            exit 0
+          fi
+
+      - name: Leave conflicting PR open
+        if: steps.mergeability.outputs.mergeable != 'MERGEABLE'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          MERGEABLE="${{ steps.mergeability.outputs.mergeable }}"
+
+          echo "PR #$PR_NUMBER cannot currently be merged automatically."
+          echo "Mergeability: $MERGEABLE"
+          echo "Leaving it open."
