@@ -3,7 +3,6 @@ name: Sync upstream stable
 on:
   workflow_dispatch:
   schedule:
-    # Check every 6 hours
     - cron: "17 */6 * * *"
 
 permissions:
@@ -22,14 +21,14 @@ jobs:
 
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Configure Git
         run: |
           git config user.name "T3 Code Plus Bot"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Get latest upstream stable release
         id: release
@@ -43,78 +42,53 @@ jobs:
             exit 1
           fi
 
-          echo "Latest upstream release: $TAG"
+          echo "Latest upstream stable release: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch upstream release
+      - name: Fetch latest upstream release
         run: |
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
-          git fetch upstream --tags --force
-
           TAG="${{ steps.release.outputs.tag }}"
 
-          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG does not exist after fetching upstream."
-            exit 1
-          fi
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
 
-      - name: Determine release commit
-        id: commit
+          # Fetch only the release tag we actually care about.
+          git fetch upstream \
+            "refs/tags/$TAG:refs/tags/$TAG" \
+            --force
+
+      - name: Determine release state
+        id: state
         run: |
           TAG="${{ steps.release.outputs.tag }}"
           RELEASE_SHA=$(git rev-list -n 1 "$TAG")
 
-          echo "Release: $TAG"
-          echo "Commit:  $RELEASE_SHA"
+          CURRENT_STABLE=$(git ls-remote origin \
+            "refs/heads/${STABLE_BRANCH}" | cut -f1)
 
-          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Check current stable
-        id: stable
-        run: |
-          CURRENT_STABLE=$(git ls-remote origin "refs/heads/${STABLE_BRANCH}" | cut -f1)
-          RELEASE_SHA="${{ steps.commit.outputs.sha }}"
-
-          echo "Current stable: ${CURRENT_STABLE:-<missing>}"
-          echo "Latest release: $RELEASE_SHA"
-
-          if [ "$CURRENT_STABLE" = "$RELEASE_SHA" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Update stable branch
-        if: steps.stable.outputs.changed == 'true'
-        run: |
-          TAG="${{ steps.release.outputs.tag }}"
-
-          echo "Moving ${STABLE_BRANCH} to $TAG"
-
-          git push origin \
-            "$TAG:refs/heads/${STABLE_BRANCH}" \
-            --force
-
-      - name: Create version bump branch
-        id: bump
-        run: |
-          TAG="${{ steps.release.outputs.tag }}"
-          RELEASE_SHA="${{ steps.commit.outputs.sha }}"
           BUMP_BRANCH="${BUMP_PREFIX}${TAG}"
 
-          echo "Creating/updating $BUMP_BRANCH at $RELEASE_SHA"
+          echo "Release tag:    $TAG"
+          echo "Release SHA:    $RELEASE_SHA"
+          echo "Current stable: ${CURRENT_STABLE:-<missing>}"
+          echo "Bump branch:    $BUMP_BRANCH"
 
-          git push origin \
-            "$RELEASE_SHA:refs/heads/$BUMP_BRANCH" \
-            --force
+          echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "bump_branch=$BUMP_BRANCH" >> "$GITHUB_OUTPUT"
 
-          echo "branch=$BUMP_BRANCH" >> "$GITHUB_OUTPUT"
+          if [ "$CURRENT_STABLE" = "$RELEASE_SHA" ]; then
+            echo "new_release=false" >> "$GITHUB_OUTPUT"
+            echo "Stable is already on $TAG."
+          else
+            echo "new_release=true" >> "$GITHUB_OUTPUT"
+            echo "New stable release detected."
+          fi
 
+      # Always clean up PRs for older upstream releases.
       - name: Close stale version bump PRs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          CURRENT_BRANCH="${{ steps.bump.outputs.branch }}"
+          CURRENT_BRANCH="${{ steps.state.outputs.bump_branch }}"
 
           gh pr list \
             --state open \
@@ -135,13 +109,25 @@ jobs:
 
             done
 
-      - name: Find or create version bump PR
-        id: pr
+      # If this is genuinely a new release, move stable.
+      - name: Update stable branch
+        if: steps.state.outputs.new_release == 'true'
+        run: |
+          RELEASE_SHA="${{ steps.state.outputs.release_sha }}"
+
+          echo "Moving ${STABLE_BRANCH} to $RELEASE_SHA"
+
+          git push origin \
+            "$RELEASE_SHA:refs/heads/${STABLE_BRANCH}" \
+            --force
+
+      # Check whether a PR for the CURRENT release is already open.
+      - name: Find existing version bump PR
+        id: existing_pr
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ steps.release.outputs.tag }}"
-          BUMP_BRANCH="${{ steps.bump.outputs.branch }}"
+          BUMP_BRANCH="${{ steps.state.outputs.bump_branch }}"
 
           PR_NUMBER=$(gh pr list \
             --state open \
@@ -150,14 +136,48 @@ jobs:
             --json number \
             --jq '.[0].number // empty')
 
-          if [ -z "$PR_NUMBER" ]; then
-            echo "Creating version bump PR for $TAG"
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
-            PR_URL=$(gh pr create \
-              --base "$PLUS_BRANCH" \
-              --head "$BUMP_BRANCH" \
-              --title "chore: update upstream to $TAG" \
-              --body "## Upstream version update
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Existing PR: #$PR_NUMBER"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No existing PR for current release."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only create a bump branch for an ACTUAL new release.
+      - name: Create version bump branch
+        if: steps.state.outputs.new_release == 'true'
+        run: |
+          RELEASE_SHA="${{ steps.state.outputs.release_sha }}"
+          BUMP_BRANCH="${{ steps.state.outputs.bump_branch }}"
+
+          echo "Creating $BUMP_BRANCH at $RELEASE_SHA"
+
+          git push origin \
+            "$RELEASE_SHA:refs/heads/$BUMP_BRANCH" \
+            --force
+
+      # Only create a PR when:
+      # - this is a new release
+      # - and one doesn't already exist
+      - name: Create version bump PR
+        if: >
+          steps.state.outputs.new_release == 'true' &&
+          steps.existing_pr.outputs.exists == 'false'
+        id: create_pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          BUMP_BRANCH="${{ steps.state.outputs.bump_branch }}"
+
+          PR_URL=$(gh pr create \
+            --base "$PLUS_BRANCH" \
+            --head "$BUMP_BRANCH" \
+            --title "chore: update upstream to $TAG" \
+            --body "## Upstream version update
 
           Updates **T3 Code Plus** to upstream stable release **$TAG**.
 
@@ -168,25 +188,53 @@ jobs:
 
           This PR was created automatically.
 
-          If it merges cleanly, the workflow will merge it automatically.
-          If there is a conflict or another merge failure, this PR will remain open for manual resolution.")
+          If it can be merged cleanly, the workflow will merge it automatically.
 
-            PR_NUMBER=$(gh pr view "$PR_URL" --json number --jq '.number')
+          If there is a merge conflict or another merge failure, this PR will remain open for manual resolution.")
+
+          PR_NUMBER=$(gh pr view "$PR_URL" \
+            --json number \
+            --jq '.number')
+
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      # Pick either:
+      # - the already-open PR
+      # - or the newly-created PR
+      - name: Resolve current PR
+        id: current_pr
+        run: |
+          EXISTING="${{ steps.existing_pr.outputs.number }}"
+          CREATED="${{ steps.create_pr.outputs.number }}"
+
+          if [ -n "$EXISTING" ]; then
+            PR_NUMBER="$EXISTING"
+          elif [ -n "$CREATED" ]; then
+            PR_NUMBER="$CREATED"
           else
-            echo "PR #$PR_NUMBER already exists."
+            PR_NUMBER=""
           fi
 
           echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Current version bump PR: #$PR_NUMBER"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "There is no version bump PR to process."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check PR mergeability
+        if: steps.current_pr.outputs.exists == 'true'
         id: mergeability
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          PR_NUMBER="${{ steps.current_pr.outputs.number }}"
 
-          # GitHub may briefly report UNKNOWN while calculating mergeability.
-          # Retry a few times before deciding.
+          MERGEABLE="UNKNOWN"
+
           for i in {1..10}; do
             MERGEABLE=$(gh pr view "$PR_NUMBER" \
               --json mergeable \
@@ -204,13 +252,15 @@ jobs:
           echo "mergeable=$MERGEABLE" >> "$GITHUB_OUTPUT"
 
       - name: Merge clean version bump
-        if: steps.mergeability.outputs.mergeable == 'MERGEABLE'
+        if: >
+          steps.current_pr.outputs.exists == 'true' &&
+          steps.mergeability.outputs.mergeable == 'MERGEABLE'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PR_NUMBER="${{ steps.pr.outputs.number }}"
+          PR_NUMBER="${{ steps.current_pr.outputs.number }}"
 
-          echo "PR #$PR_NUMBER is mergeable. Attempting automatic merge."
+          echo "PR #$PR_NUMBER is mergeable."
 
           if gh pr merge "$PR_NUMBER" \
             --merge \
@@ -219,19 +269,22 @@ jobs:
             echo "Version bump merged successfully."
           else
             echo "Automatic merge failed."
-            echo "Leaving PR #$PR_NUMBER open for manual intervention."
-
-            exit 0
+            echo "Leaving PR #$PR_NUMBER open."
           fi
 
-      - name: Leave conflicting PR open
-        if: steps.mergeability.outputs.mergeable != 'MERGEABLE'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Report unresolved version bump
+        if: >
+          steps.current_pr.outputs.exists == 'true' &&
+          steps.mergeability.outputs.mergeable != 'MERGEABLE'
         run: |
-          PR_NUMBER="${{ steps.pr.outputs.number }}"
-          MERGEABLE="${{ steps.mergeability.outputs.mergeable }}"
+          echo "Version bump PR #${{ steps.current_pr.outputs.number }} could not be merged automatically."
+          echo "Leaving the PR open for manual resolution."
 
-          echo "PR #$PR_NUMBER cannot currently be merged automatically."
-          echo "Mergeability: $MERGEABLE"
-          echo "Leaving it open."
+      - name: Nothing to do
+        if: >
+          steps.state.outputs.new_release == 'false' &&
+          steps.current_pr.outputs.exists == 'false'
+        run: |
+          echo "Stable already matches the latest upstream release."
+          echo "There is no pending version bump PR."
+          echo "Nothing to do."
