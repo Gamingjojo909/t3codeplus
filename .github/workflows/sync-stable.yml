@@ -6,10 +6,14 @@ on:
     - cron: "17 */6 * * *"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+
+concurrency:
+  group: sync-upstream-stable
+  cancel-in-progress: false
 
 env:
+  GH_REPO: ${{ github.repository }}
   UPSTREAM_REPO: pingdotgg/t3code
   STABLE_BRANCH: stable
   PLUS_BRANCH: plus
@@ -18,12 +22,29 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
 
     steps:
+      - name: Check sync credential
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Set UPSTREAM_SYNC_TOKEN with Contents, Pull requests, and Workflows read/write access to this repository. The built-in GITHUB_TOKEN cannot push upstream workflow changes."
+            exit 1
+          fi
+
       - name: Checkout fork
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
 
       - name: Configure Git
         run: |
@@ -74,6 +95,17 @@ jobs:
 
           echo "release_sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
           echo "bump_branch=$BUMP_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "current_stable=$CURRENT_STABLE" >> "$GITHUB_OUTPUT"
+
+          # Stable can already be updated after a partially failed run.
+          # Only plus containing the release means the upgrade is complete.
+          STATUS=0
+          git merge-base --is-ancestor "$RELEASE_SHA" "origin/$PLUS_BRANCH" || STATUS=$?
+          case "$STATUS" in
+            0) echo "needs_upgrade=false" >> "$GITHUB_OUTPUT" ;;
+            1) echo "needs_upgrade=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$STATUS" ;;
+          esac
 
           if [ "$CURRENT_STABLE" = "$RELEASE_SHA" ]; then
             echo "new_release=false" >> "$GITHUB_OUTPUT"
@@ -86,7 +118,7 @@ jobs:
       # Always clean up PRs for older upstream releases.
       - name: Close stale version bump PRs
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           CURRENT_BRANCH="${{ steps.state.outputs.bump_branch }}"
 
@@ -119,13 +151,13 @@ jobs:
 
           git push origin \
             "$RELEASE_SHA:refs/heads/${STABLE_BRANCH}" \
-            --force
+            --force-with-lease="refs/heads/${STABLE_BRANCH}:${{ steps.state.outputs.current_stable }}"
 
       # Check whether a PR for the CURRENT release is already open.
       - name: Find existing version bump PR
         id: existing_pr
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           BUMP_BRANCH="${{ steps.state.outputs.bump_branch }}"
 
@@ -146,29 +178,33 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Only create a bump branch for an ACTUAL new release.
+      # Retry incomplete upgrades even when stable already points at the release.
       - name: Create version bump branch
-        if: steps.state.outputs.new_release == 'true'
+        if: steps.state.outputs.needs_upgrade == 'true'
         run: |
           RELEASE_SHA="${{ steps.state.outputs.release_sha }}"
           BUMP_BRANCH="${{ steps.state.outputs.bump_branch }}"
 
-          echo "Creating $BUMP_BRANCH at $RELEASE_SHA"
-
-          git push origin \
-            "$RELEASE_SHA:refs/heads/$BUMP_BRANCH" \
-            --force
+          EXISTING_SHA=$(git ls-remote origin "refs/heads/$BUMP_BRANCH" | cut -f1)
+          if [ -n "$EXISTING_SHA" ]; then
+            echo "Preserving existing $BUMP_BRANCH (including any manual conflict resolution)."
+          else
+            echo "Creating $BUMP_BRANCH at $RELEASE_SHA"
+            git push origin \
+              "$RELEASE_SHA:refs/heads/$BUMP_BRANCH" \
+              --force-with-lease="refs/heads/$BUMP_BRANCH:"
+          fi
 
       # Only create a PR when:
-      # - this is a new release
+      # - plus does not yet contain the release
       # - and one doesn't already exist
       - name: Create version bump PR
         if: >
-          steps.state.outputs.new_release == 'true' &&
+          steps.state.outputs.needs_upgrade == 'true' &&
           steps.existing_pr.outputs.exists == 'false'
         id: create_pr
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           TAG="${{ steps.release.outputs.tag }}"
           BUMP_BRANCH="${{ steps.state.outputs.bump_branch }}"
@@ -229,7 +265,7 @@ jobs:
         if: steps.current_pr.outputs.exists == 'true'
         id: mergeability
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           PR_NUMBER="${{ steps.current_pr.outputs.number }}"
 
@@ -256,7 +292,7 @@ jobs:
           steps.current_pr.outputs.exists == 'true' &&
           steps.mergeability.outputs.mergeable == 'MERGEABLE'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           PR_NUMBER="${{ steps.current_pr.outputs.number }}"
 
@@ -283,6 +319,7 @@ jobs:
       - name: Nothing to do
         if: >
           steps.state.outputs.new_release == 'false' &&
+          steps.state.outputs.needs_upgrade == 'false' &&
           steps.current_pr.outputs.exists == 'false'
         run: |
           echo "Stable already matches the latest upstream release."
